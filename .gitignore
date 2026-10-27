@@ -1,0 +1,15 @@
+# Release allowlist. Working memories, raw materials and local configuration stay out.
+*
+!.gitignore
+!.gitattributes
+!README.md
+!SKILL.md
+!CHECKS.md
+!references/
+!references/创作方法.md
+!references/经验与接续.md
+!references/项目记录模板.md
+!tests/
+!tests/README.md
+!tests/inputs.json
+!tests/rubrics.json

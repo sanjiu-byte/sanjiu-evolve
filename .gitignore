@@ -18,3 +18,7 @@
 !tests/rubrics.json
 !tests/v0.3-inputs.json
 !tests/v0.3-rubrics.json
+!references/局部改稿检查.md
+!scripts/
+!scripts/edit_guard.py
+!tests/test_edit_guard.py

@@ -8,6 +8,7 @@
 !员工上手指南.md
 !references/
 !references/创作方法.md
+!references/修改与案例.md
 !references/经验与接续.md
 !references/项目记录模板.md
 !references/首次启用.md
@@ -15,3 +16,5 @@
 !tests/README.md
 !tests/inputs.json
 !tests/rubrics.json
+!tests/v0.3-inputs.json
+!tests/v0.3-rubrics.json

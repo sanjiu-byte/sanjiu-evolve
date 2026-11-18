@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -44,8 +45,11 @@ class EditGuardTests(unittest.TestCase):
     def write_json(self, path, value):
         path.write_bytes((json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8"))
 
-    def prepare(self):
-        return guard.prepare(argparse.Namespace(baseline=str(self.baseline), requirements=str(self.requirements), request_file=str(self.request), scope=str(self.scope), session=str(self.session)))
+    def prepare(self, dependencies=None):
+        args = argparse.Namespace(baseline=str(self.baseline), requirements=str(self.requirements), request_file=str(self.request), scope=str(self.scope), session=str(self.session))
+        if dependencies is not None:
+            args.dependency = [str(path) for path in dependencies]
+        return guard.prepare(args)
 
     def render(self, output=None):
         return guard.render(argparse.Namespace(session=str(self.session), edits=str(self.edits), output=str(output or self.output)))
@@ -136,6 +140,115 @@ class EditGuardTests(unittest.TestCase):
         self.request.write_bytes("现在明确重写整个结尾。".encode())
         self.assert_guard_error("source_changed", self.render)
         self.assertEqual(self.baseline.read_bytes(), self.original)
+
+    def test_explicit_dependencies_freeze_exact_bytes_and_preserve_output(self):
+        rules = self.root / "项目要求.md"
+        mapping = self.root / "素材映射.json"
+        rules.write_bytes(guard.BOM + "保留后退。\r\n".encode())
+        mapping.write_bytes(b'{"character": 2}\n')
+        originals = {path: path.read_bytes() for path in [rules, mapping]}
+        prepared = self.prepare([rules, mapping, rules])
+        manifest = json.loads((self.session / "manifest.json").read_bytes())
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["dependencies"], [
+            {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest()}
+            for path, raw in originals.items()
+        ])
+        self.assertEqual(prepared["dependency_count"], 2)
+        self.assertEqual(set(path.name for path in self.session.iterdir()), {*guard.SNAPSHOTS.values(), "packet.md", "manifest.json", "manifest.sha256"})
+        rendered = self.render()
+        self.assertEqual(rendered["dependency_count"], 2)
+        self.assertEqual(self.output.read_bytes(), self.original.replace("小鹿先惊讶，然后后退。".encode(), "小鹿瞪眼，退半步。".encode()))
+        self.assertEqual(self.check()["status"], "scope_preserved")
+        self.assertEqual(self.check()["semantic_check"], "not_evaluated")
+        for path, raw in originals.items():
+            self.assertEqual(path.read_bytes(), raw)
+        self.assert_guard_error("protected_output_path", lambda: self.render(rules))
+
+    def test_changed_dependency_invalidates_render_and_check_without_input_changes(self):
+        rules = self.root / "项目要求.md"
+        rules.write_bytes("素材使用图2。\r\n".encode())
+        unchanged_inputs = {path: path.read_bytes() for path in [self.baseline, self.requirements, self.request, self.scope]}
+        self.prepare([rules])
+        self.render()
+        original_candidate = self.output.read_bytes()
+        rules.write_bytes("素材改用图3。\r\n".encode())
+        next_output = self.root / "不应生成.md"
+        self.assert_guard_error("dependency_changed", lambda: self.render(next_output))
+        self.assert_guard_error("dependency_changed", self.check)
+        self.assertFalse(next_output.exists())
+        self.assertEqual(self.output.read_bytes(), original_candidate)
+        for path, raw in unchanged_inputs.items():
+            self.assertEqual(path.read_bytes(), raw)
+
+    def test_missing_dependency_invalidates_render_and_check(self):
+        rules = self.root / "项目要求.md"
+        rules.write_bytes(b"original rule\n")
+        self.prepare([rules])
+        self.render()
+        candidate = self.output.read_bytes()
+        rules.unlink()
+        self.assert_guard_error("dependency_unavailable", lambda: self.render(self.root / "another.md"))
+        self.assert_guard_error("dependency_unavailable", self.check)
+        self.assertEqual(self.output.read_bytes(), candidate)
+
+    def test_unavailable_dependencies_fail_before_session_creation(self):
+        for path in [self.root / "missing.md", self.root]:
+            with self.subTest(path=path):
+                self.assert_guard_error("dependency_unavailable", lambda: self.prepare([path]))
+                self.assertFalse(self.session.exists())
+
+    def test_dependency_changed_during_prepare_does_not_create_session(self):
+        rules = self.root / "项目要求.md"
+        rules.write_bytes(b"original rule")
+        real_read = guard.read_dependency
+        calls = 0
+
+        def changed_after_read(path):
+            nonlocal calls
+            raw = real_read(path)
+            calls += 1
+            if calls == 1:
+                path.write_bytes(b"updated rule")
+            return raw
+
+        with mock.patch.object(guard, "read_dependency", changed_after_read):
+            self.assert_guard_error("dependency_changed", lambda: self.prepare([rules]))
+        self.assertFalse(self.session.exists())
+
+    def test_legacy_session_remains_usable_without_inferred_dependencies(self):
+        rules = self.root / "仅文字引用.md"
+        rules.write_bytes(b"before")
+        self.write_json(self.requirements, {"requirements": [{"id": "R1", "text": "保留结尾", "source": str(rules)}]})
+        prepared = self.prepare()
+        manifest = json.loads((self.session / "manifest.json").read_bytes())
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertNotIn("dependencies", manifest)
+        self.assertNotIn("dependency_count", prepared)
+        rules.write_bytes(b"after")
+        self.render()
+        report = self.check()
+        self.assertEqual(report["status"], "scope_preserved")
+        self.assertNotIn("dependency_count", report)
+
+    def test_dependency_session_cannot_silently_omit_tracking(self):
+        rules = self.root / "项目要求.md"
+        rules.write_bytes(b"rule")
+        self.prepare([rules])
+        manifest_path = self.session / "manifest.json"
+        original = json.loads(manifest_path.read_bytes())
+        bad_versions = [
+            {**original, "schema_version": 1},
+            {key: value for key, value in original.items() if key != "dependencies"},
+            {**original, "dependencies": [{"path": "relative.md", "sha256": "0" * 64}]},
+        ]
+        for value in bad_versions:
+            with self.subTest(value=value):
+                raw = json.dumps(value).encode()
+                manifest_path.write_bytes(raw)
+                (self.session / "manifest.sha256").write_bytes((hashlib.sha256(raw).hexdigest() + "\n").encode())
+                self.assert_guard_error("invalid_session", self.render)
+                self.assertFalse(self.output.exists())
 
     def test_tampered_snapshot_packet_and_manifest_are_rejected(self):
         self.prepare()
@@ -290,6 +403,23 @@ class EditGuardTests(unittest.TestCase):
                 result = json.loads(completed.stdout)
                 self.assertEqual(result["code"], "invalid_arguments")
                 self.assertEqual(result["semantic_check"], "not_evaluated")
+
+    def test_cli_repeated_dependencies_and_changed_dependency_exit_code(self):
+        rules = self.root / "项目要求.md"
+        mapping = self.root / "素材映射.md"
+        rules.write_bytes(b"rule")
+        mapping.write_bytes(b"image 2")
+        command = [sys.executable, str(SCRIPT), "prepare", "--baseline", str(self.baseline), "--requirements", str(self.requirements), "--request-file", str(self.request), "--scope", str(self.scope), "--session", str(self.session), "--dependency", str(rules), "--dependency", str(mapping)]
+        completed = subprocess.run(command, capture_output=True)
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertEqual(json.loads(completed.stdout)["dependency_count"], 2)
+        self.render()
+        mapping.write_bytes(b"image 3")
+        completed = subprocess.run([sys.executable, str(SCRIPT), "check", "--session", str(self.session), "--edits", str(self.edits), "--candidate", str(self.output)], capture_output=True)
+        self.assertEqual(completed.returncode, 2)
+        report = json.loads(completed.stdout)
+        self.assertEqual(report["code"], "dependency_changed")
+        self.assertEqual(report["semantic_check"], "not_evaluated")
 
 
 if __name__ == "__main__":

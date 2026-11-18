@@ -15,7 +15,8 @@ from pathlib import Path
 import sys
 
 
-VERSION = 1
+VERSION = 2
+LEGACY_VERSION = 1
 SNAPSHOTS = {
     "baseline": "baseline.md",
     "requirements": "requirements.json",
@@ -95,6 +96,42 @@ def validate_requirements(data: bytes) -> list[dict]:
     return result
 
 
+def read_dependency(path: Path) -> bytes:
+    try:
+        return read_bytes(path)
+    except GuardError as exc:
+        raise GuardError("dependency_unavailable", f"Declared dependency cannot be read: {path} ({exc.code}); prepare again after checking the source") from exc
+
+
+def freeze_dependencies(paths) -> list[dict]:
+    # Keep the declared entry path so retargeting a symlink is also observable.
+    unique_paths = dict.fromkeys(Path(os.path.abspath(path)) for path in paths)
+    return [{"path": str(path), "sha256": digest(read_dependency(path))} for path in unique_paths]
+
+
+def verify_dependencies(records) -> list[Path]:
+    if not isinstance(records, list):
+        raise GuardError("invalid_session", "Invalid dependency inventory; prepare again")
+    paths = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"} or not all(isinstance(value, str) for value in record.values()):
+            raise GuardError("invalid_session", "Invalid dependency record; prepare again")
+        path = Path(record["path"])
+        fingerprint = record["sha256"]
+        if not path.is_absolute() or path in paths or len(fingerprint) != 64 or any(char not in "0123456789abcdef" for char in fingerprint):
+            raise GuardError("invalid_session", "Invalid dependency path or hash; prepare again")
+        if digest(read_dependency(path)) != fingerprint:
+            raise GuardError("dependency_changed", f"Declared dependency changed: {path}; read current requirements and prepare a new session")
+        paths.append(path)
+    return paths
+
+
+def dependency_report(count: int) -> dict:
+    if not count:
+        return {}
+    return {"dependency_count": count, "dependency_freshness": "declared_files_verified_at_command_start"}
+
+
 def locate_spans(baseline: bytes, scope: bytes) -> list[dict]:
     decode(baseline, "baseline")
     editable = rows(parse_json(scope, "scope"), "editable", {"id", "text"})
@@ -166,6 +203,12 @@ def prepare(args) -> dict:
     if os.path.lexists(requested_session):
         raise GuardError("session_exists", f"Refusing to reuse existing session: {requested_session}")
     session = requested_session.resolve()
+    dependencies = freeze_dependencies(getattr(args, "dependency", None) or [])
+    dependency_packet = (
+        "\n\n## 显式声明的上游来源指纹\n\n"
+        "仅核对这些文件是否变化；未声明的来源不追踪，哈希不证明要求或成品语义正确。\n\n"
+        + json.dumps(dependencies, ensure_ascii=False, indent=2)
+    ) if dependencies else ""
     packet = (
         "# 本轮局部改稿材料\n\n"
         "以下为本轮数据。范围由任务执行者依据用户要求选定；工具不判断选区是否正确。\n"
@@ -173,18 +216,22 @@ def prepare(args) -> dict:
         "## 当前有效要求及来源\n\n" + json.dumps({"requirements": requirements}, ensure_ascii=False, indent=2)
         + "\n\n## 本轮用户原话\n\n" + request
         + "\n\n## 可修改片段\n\n" + decode(data["scope"], "scope")
+        + dependency_packet
         + "\n\n## 原稿\n\n" + baseline_text
     ).encode("utf-8")
     manifest = {
-        "schema_version": VERSION,
+        "schema_version": VERSION if dependencies else LEGACY_VERSION,
         "sources": {name: {"path": str(source_paths[name]), "sha256": digest(raw)} for name, raw in data.items()},
         "snapshots": {SNAPSHOTS[name]: digest(raw) for name, raw in data.items()},
         "packet_sha256": digest(packet),
     }
+    if dependencies:
+        manifest["dependencies"] = dependencies
     manifest_bytes = encode_json(manifest)
     for name, path in source_paths.items():
         if read_bytes(path) != data[name]:
             raise GuardError("source_changed", "An input changed during preparation; prepare again")
+    verify_dependencies(dependencies)
     try:
         session.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
@@ -202,6 +249,7 @@ def prepare(args) -> dict:
         "editable_ids": [span["id"] for span in spans],
         "source_freshness": "four_input_files_verified",
         "semantic_check": "not_evaluated",
+        **dependency_report(len(dependencies)),
     }
 
 
@@ -212,8 +260,11 @@ def load_session(path: str):
     if seal != (digest(raw) + "\n").encode("ascii"):
         raise GuardError("snapshot_changed", "Session manifest changed or preparation was incomplete; prepare again")
     manifest = parse_json(raw, "manifest")
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != VERSION:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in (LEGACY_VERSION, VERSION):
         raise GuardError("invalid_session", "Unsupported session format; prepare again")
+    dependencies = manifest.get("dependencies", [])
+    if (manifest["schema_version"] == LEGACY_VERSION and "dependencies" in manifest) or (manifest["schema_version"] == VERSION and not dependencies):
+        raise GuardError("invalid_session", "Dependency tracking requires the current session format and explicit records; prepare again")
     if set(manifest.get("sources", {})) != set(SNAPSHOTS) or set(manifest.get("snapshots", {})) != set(SNAPSHOTS.values()):
         raise GuardError("invalid_session", "Invalid source or snapshot inventory; prepare again")
     data = {}
@@ -236,11 +287,13 @@ def load_session(path: str):
         raise GuardError("snapshot_changed", "Context packet changed; prepare a new session")
     validate_requirements(data["requirements"])
     spans = locate_spans(data["baseline"], data["scope"])
-    return session, data, spans, source_paths
+    dependency_paths = verify_dependencies(dependencies)
+    source_paths.extend(path.resolve() for path in dependency_paths)
+    return session, data, spans, source_paths, len(dependency_paths)
 
 
 def expected_output(args):
-    session, data, spans, source_paths = load_session(args.session)
+    session, data, spans, source_paths, dependency_count = load_session(args.session)
     edits_path = Path(args.edits).resolve()
     replacements = rows(parse_json(read_bytes(edits_path), "edits"), "replacements", {"id", "text"})
     by_id = {row["id"]: row["text"].encode("utf-8") for row in replacements}
@@ -256,11 +309,11 @@ def expected_output(args):
             changed.append(span["id"])
         end = span["end"]
     parts.append(baseline[end:])
-    return session, b"".join(parts), changed, source_paths + [edits_path]
+    return session, b"".join(parts), changed, source_paths + [edits_path], dependency_count
 
 
 def render(args) -> dict:
-    session, expected, changed, protected_paths = expected_output(args)
+    session, expected, changed, protected_paths, dependency_count = expected_output(args)
     requested_output = Path(args.output).absolute()
     output = requested_output.resolve()
     if output == session or session in output.parents or output in protected_paths:
@@ -273,11 +326,12 @@ def render(args) -> dict:
         "changed_ids": changed, "mechanical_check": "outside_scope_preserved",
         "source_freshness": "four_input_files_verified_at_command_start",
         "semantic_check": "not_evaluated",
+        **dependency_report(dependency_count),
     }
 
 
 def check(args) -> dict:
-    _, expected, changed, _ = expected_output(args)
+    _, expected, changed, _, dependency_count = expected_output(args)
     candidate_path = Path(args.candidate).resolve()
     candidate = read_bytes(candidate_path)
     matches = candidate == expected
@@ -287,6 +341,7 @@ def check(args) -> dict:
         "expected_sha256": digest(expected), "changed_ids": changed,
         "source_freshness": "four_input_files_verified_at_command_start",
         "semantic_check": "not_evaluated",
+        **dependency_report(dependency_count),
     }
     if not matches:
         offset = next((i for i, (left, right) in enumerate(zip(expected, candidate)) if left != right), min(len(expected), len(candidate)))
@@ -305,6 +360,7 @@ def parser() -> argparse.ArgumentParser:
     prep = commands.add_parser("prepare", help="Freeze current inputs and a bounded editing scope")
     for flag in ["baseline", "requirements", "request-file", "scope", "session"]:
         prep.add_argument("--" + flag, required=True)
+    prep.add_argument("--dependency", action="append", default=[], metavar="FILE", help="Explicit upstream file to fingerprint; repeat for multiple files (never inferred from source text)")
     for name in ["render", "check"]:
         command = commands.add_parser(name)
         command.add_argument("--session", required=True)
